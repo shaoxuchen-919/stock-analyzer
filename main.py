@@ -1089,7 +1089,10 @@ async def api_compare(codes: str = Query(..., min_length=1)):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    try:
+        return templates.TemplateResponse("index.html", {"request": request})
+    except Exception as e:
+        return HTMLResponse(f"<h2>Template Error</h2><pre>{e}</pre><p>BASE_DIR={BASE_DIR}</p>", status_code=500)
 
 
 # ── 启动入口 ────────────────────────────────────────────────
