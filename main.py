@@ -19,13 +19,11 @@ from typing import Any
 import akshare as ak
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="A股+美股多因子量化分析", version="2.0.0")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 # ── 缓存 ───────────────────────────────────────────────────
 _cache: dict[str, tuple[float, Any]] = {}
@@ -1088,11 +1086,10 @@ async def api_compare(codes: str = Query(..., min_length=1)):
 # ── 前端页面 ────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    try:
-        return templates.TemplateResponse("index.html", {"request": request})
-    except Exception as e:
-        return HTMLResponse(f"<h2>Template Error</h2><pre>{e}</pre><p>BASE_DIR={BASE_DIR}</p>", status_code=500)
+async def index():
+    index_path = os.path.join(BASE_DIR, "templates", "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
 
 # ── 启动入口 ────────────────────────────────────────────────
