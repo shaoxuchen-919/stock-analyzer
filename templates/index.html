@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>A股多因子量化分析</title>
+<title>A股+美股 多因子量化分析</title>
 <style>
   :root {
     --bg: #f5f5f7;
@@ -176,7 +176,7 @@
 <body>
 <div class="container">
   <header>
-    <h1>A股多因子量化分析</h1>
+    <h1>A股+美股 多因子量化分析</h1>
     <p>动量 · 均值回归 · 技术指标 · 量价分析 · 基本面 · 市场环境 — 六维权重打分</p>
   </header>
 
@@ -189,7 +189,7 @@
   <div id="tab-single">
     <div class="search-wrap">
       <div class="search-row">
-        <input type="text" id="stock-input" placeholder="输入股票名称或6位代码，如 恒瑞医药 / 600276"
+        <input type="text" id="stock-input" placeholder="输入股票名称或代码，A股/美股均可，如 恒瑞医药 / AAPL"
                autocomplete="off" 
                oninput="handleInput(this.value)"
                onkeydown="handleKey(event)">
@@ -205,9 +205,9 @@
       <span class="quick-pick" onclick="quickAnalyze('600276')">恒瑞医药</span>
       <span class="quick-pick" onclick="quickAnalyze('002962')">五方光电</span>
       <span class="quick-pick" onclick="quickAnalyze('600584')">长电科技</span>
-      <span class="quick-pick" onclick="quickAnalyze('600519')">贵州茅台</span>
-      <span class="quick-pick" onclick="quickAnalyze('300750')">宁德时代</span>
-      <span class="quick-pick" onclick="quickAnalyze('000858')">五 粮 液</span>
+      <span class="quick-pick" onclick="quickAnalyze('AAPL')">苹果</span>
+      <span class="quick-pick" onclick="quickAnalyze('NVDA')">英伟达</span>
+      <span class="quick-pick" onclick="quickAnalyze('TSLA')">特斯拉</span>
     </div>
 
     <div id="stock-result">
@@ -223,7 +223,7 @@
   <!-- Compare Tab -->
   <div id="tab-compare" style="display:none">
     <div class="search-row" style="margin-bottom:16px">
-      <input type="text" id="compare-input" placeholder="输入多个代码，逗号分隔，如 600276,600519,300750"
+      <input type="text" id="compare-input" placeholder="输入多个代码，逗号分隔，A股美股混合均可，如 600276,AAPL,TSLA"
              onkeydown="if(event.key==='Enter')compare()">
       <button id="compare-btn" onclick="compare()">对比</button>
     </div>
@@ -245,7 +245,7 @@
   </div>
 
   <footer>
-    数据来源：东方财富 · AkShare &nbsp;|&nbsp; 因子引擎 v1.0 &nbsp;|&nbsp;
+    数据来源：东方财富 · AkShare &nbsp;|&nbsp; 因子引擎 v2.0（A股+美股） &nbsp;|&nbsp;
     ⚠ 量化因子分析仅供参考，不构成投资建议
   </footer>
 </div>
@@ -292,11 +292,17 @@ function renderHistory() {
 }
 
 // ── Search ──
+function isCode(input) {
+  // A股6位数字 或 美股ticker(1-5字母)
+  return /^\d{6}$/.test(input) || /^[A-Za-z]{1,5}$/.test(input);
+}
+
 async function handleInput(val) {
   clearTimeout(searchTimer);
   const dropdown = document.getElementById('dropdown');
   if (val.length < 1) { dropdown.classList.remove('show'); return; }
-  if (/^\d{1,6}$/.test(val)) { dropdown.classList.remove('show'); return; }
+  // 如果是纯代码（数字6位或纯字母1-5位），不搜索
+  if (isCode(val.replace(/\s/g,''))) { dropdown.classList.remove('show'); return; }
 
   searchTimer = setTimeout(async () => {
     try {
@@ -307,8 +313,9 @@ async function handleInput(val) {
       }
       let html = '';
       for (const r of data.results) {
+        const marketLabel = r.市场 ? `<span class="type-badge" style="font-size:10px;margin-left:6px">${r.市场}</span>` : '';
         html += `<div class="item" onclick="pickStock('${r.代码}','${r.名称}')">
-          <span>${r.名称}</span><span class="code">${r.代码}</span></div>`;
+          <span>${r.名称}${marketLabel}</span><span class="code">${r.代码}</span></div>`;
       }
       dropdown.innerHTML = html;
       dropdown.classList.add('show');
@@ -359,11 +366,11 @@ async function analyze() {
   try {
     let code = input;
     let name = input;
-    if (!/^\d{6}$/.test(input)) {
+    if (!isCode(input)) {
       const resp = await fetch(`/api/search?q=${encodeURIComponent(input)}`);
       const data = await resp.json();
       if (!data.results || data.results.length === 0) {
-        resultDiv.innerHTML = '<div class="error">未找到匹配的股票，请检查名称或直接输入6位代码</div>';
+        resultDiv.innerHTML = '<div class="error">未找到匹配的股票，请检查名称或直接输入代码（A股6位数字 / 美股ticker如AAPL）</div>';
         btn.disabled = false; return;
       }
       code = data.results[0].代码;
@@ -402,17 +409,20 @@ function renderAnalysis(d, container) {
   const cls = d.change_pct >= 0 ? 'red' : 'green';
   const sgn = d.change_pct >= 0 ? '+' : '';
   const color = scoreColor(d.total_score);
+  const marketLabel = d.market === 'us' ? '美股' : 'A股';
+  const mcapUnit = d.market === 'us' && d.market_cap ? d.market_cap + '亿(美元)' : (d.market_cap != null ? d.market_cap + '亿' : '--');
 
   let h = `
   <div class="card">
     <div class="stock-header">
       <span class="stock-name">${esc(d.name)}</span>
+      <span class="type-badge" style="font-size:12px">${marketLabel}</span>
       <span class="stock-code">${d.code}</span>
       <span class="stock-price">${d.price}</span>
       <span class="stock-change ${cls}">${sgn}${d.change_pct}%</span>
     </div>
     <div class="meta-row">
-      <span>市值 <strong>${d.market_cap != null ? d.market_cap+'亿' : '--'}</strong></span>
+      <span>市值 <strong>${mcapUnit}</strong></span>
       <span>PE <strong>${d.pe ?? '--'}</strong></span>
       <span>类型 <span class="type-badge">${typeLabel(d.stock_type)}</span></span>
       <span>耗时 <strong>${d.elapsed_ms}ms</strong></span>
@@ -509,14 +519,16 @@ async function compare() {
 function renderComparison(data, container) {
   let h = '<div class="card"><h2>横向对比</h2>';
   h += '<table class="cmp-table"><thead><tr>';
-  ['名称','代码','价格','涨跌','PE','类型','评分','概率'].forEach(t => h += `<th>${t}</th>`);
+  ['名称','代码','市场','价格','涨跌','PE','类型','评分','概率'].forEach(t => h += `<th>${t}</th>`);
   h += '</tr></thead><tbody>';
   const sorted = (data.comparison||[]).sort((a,b) => (b.score||0)-(a.score||0));
   for (const r of sorted) {
     const c = r.change >= 0 ? 'red' : 'green';
     const sc = scoreColor(r.score);
+    const mkt = r.market === 'us' ? '🇺🇸美股' : '🇨🇳A股';
     h += `<tr>
       <td><strong>${esc(r.name)}</strong></td><td style="color:var(--muted)">${r.code}</td>
+      <td style="font-size:11px">${mkt}</td>
       <td>${r.price}</td><td class="${c}">${r.change>=0?'+':''}${r.change}%</td>
       <td>${r.pe??'--'}</td><td><span class="type-badge">${typeLabel(r.type)}</span></td>
       <td><strong style="color:${sc};font-size:15px">${r.score}</strong></td>
