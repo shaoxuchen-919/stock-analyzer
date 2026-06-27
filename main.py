@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 import time
 from datetime import datetime, timedelta
@@ -23,7 +24,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="A股+美股多因子量化分析", version="2.0.0")
-templates = Jinja2Templates(directory="templates")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 # ── 缓存 ───────────────────────────────────────────────────
 _cache: dict[str, tuple[float, Any]] = {}
