@@ -16,9 +16,31 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
+import httpx
 import akshare as ak
 import numpy as np
 import pandas as pd
+
+# ── 全局 HTTP Headers（绕过反爬） ───────────────────────────
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://finance.eastmoney.com/",
+    "Connection": "keep-alive",
+}
+
+def _patch_akshare_headers():
+    """给 AkShare 底层 Session 注入 Headers，规避境外IP反爬"""
+    try:
+        import akshare.utils.cons as _cons  # type: ignore
+        session = getattr(_cons, "session", None)
+        if session is not None:
+            session.headers.update(_HEADERS)
+    except Exception:
+        pass
+
+_patch_akshare_headers()
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -67,16 +89,24 @@ def detect_market(code: str) -> str:
 # ── 数据获取（A股）──────────────────────────────────────────
 
 def _fetch_daily(code: str, days: int = 250) -> pd.DataFrame:
-    """获取日K线（前复权）—— 单票接口，2-5秒"""
+    """获取日K线（前复权）—— 单票接口，重试3次"""
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=400)).strftime("%Y%m%d")
-    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start,
-                            end_date=end, adjust="qfq")
-    if df is None or df.empty:
-        raise ValueError(f"无法获取 {code} 的日K线数据")
-    df = df.sort_values("日期").tail(days).reset_index(drop=True)
-    df.columns = [c.strip() for c in df.columns]
-    return df
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start,
+                                    end_date=end, adjust="qfq")
+            if df is None or df.empty:
+                raise ValueError(f"无法获取 {code} 的日K线数据")
+            df = df.sort_values("日期").tail(days).reset_index(drop=True)
+            df.columns = [c.strip() for c in df.columns]
+            return df
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2)
+    raise ValueError(f"获取 {code} 日K线失败（已重试3次）: {last_err}")
 
 
 def _get_daily(code: str, days: int = 250) -> pd.DataFrame:
@@ -115,24 +145,26 @@ def _get_financials(code: str) -> dict:
         if records:
             return records[0]
         return {}
-    try:
-        fin = ak.stock_financial_abstract(symbol=code)
-        if fin is None or fin.empty:
-            raise ValueError("empty financial data")
-        # 提取关键指标：指标名 → 最新季度值
-        result = {}
-        for i in range(len(fin)):
-            metric = str(fin.iloc[i, 1]).strip()
-            val = fin.iloc[i, 2]  # 最新季度（第3列是最近期）
-            if pd.notna(val):
-                try:
-                    result[metric] = float(val)
-                except (ValueError, TypeError):
-                    result[metric] = val
-        _cache_set(key, pd.DataFrame([result]))
-        return result
-    except Exception:
-        pass
+    for attempt in range(3):
+        try:
+            fin = ak.stock_financial_abstract(symbol=code)
+            if fin is None or fin.empty:
+                raise ValueError("empty financial data")
+            # 提取关键指标：指标名 → 最新季度值
+            result = {}
+            for i in range(len(fin)):
+                metric = str(fin.iloc[i, 1]).strip()
+                val = fin.iloc[i, 2]  # 最新季度（第3列是最近期）
+                if pd.notna(val):
+                    try:
+                        result[metric] = float(val)
+                    except (ValueError, TypeError):
+                        result[metric] = val
+            _cache_set(key, pd.DataFrame([result]))
+            return result
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
     empty = {}
     _cache_set(key, pd.DataFrame([empty]))
     return empty
