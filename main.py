@@ -1,13 +1,13 @@
 """
 =============================================================================
-  A股+美股 多因子量化分析系统  —  FastAPI + AkShare
+  A股+美股 多因子量化分析系统  —  FastAPI + yfinance
   单票分析 + 多票对比 + 动态权重 + 概率评估
+  数据源: Yahoo Finance (全球可访问)
 =============================================================================
 """
 
 from __future__ import annotations
 
-import asyncio
 import math
 import os
 import re
@@ -16,40 +16,19 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
-import httpx
-import akshare as ak
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
-# ── 全局 HTTP Headers（绕过反爬） ───────────────────────────
-_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Referer": "https://finance.eastmoney.com/",
-    "Connection": "keep-alive",
-}
-
-def _patch_akshare_headers():
-    """给 AkShare 底层 Session 注入 Headers，规避境外IP反爬"""
-    try:
-        import akshare.utils.cons as _cons  # type: ignore
-        session = getattr(_cons, "session", None)
-        if session is not None:
-            session.headers.update(_HEADERS)
-    except Exception:
-        pass
-
-_patch_akshare_headers()
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-app = FastAPI(title="A股+美股多因子量化分析", version="2.0.0")
+app = FastAPI(title="A股+美股多因子量化分析", version="3.0.0")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 缓存 ───────────────────────────────────────────────────
 _cache: dict[str, tuple[float, Any]] = {}
-CACHE_TTL = 600  # 10分钟（日线数据交易日不变）
+CACHE_TTL = 900  # 15分钟（Yahoo数据更新频率）
 
 
 def _cache_key(prefix: str, code: str) -> str:
@@ -74,7 +53,7 @@ def _cache_set(key: str, val):
             del _cache[k]
 
 
-# ── 市场检测 ────────────────────────────────────────────────
+# ── 市场检测 & Yahoo Ticker 转换 ───────────────────────────
 
 def detect_market(code: str) -> str:
     """检测市场: 'cn' = A股, 'us' = 美股"""
@@ -86,58 +65,149 @@ def detect_market(code: str) -> str:
     raise ValueError(f"无法识别市场: {code}，请输入6位A股代码或美股ticker（如 AAPL）")
 
 
-# ── 数据获取（A股）──────────────────────────────────────────
-
-def _fetch_daily(code: str, days: int = 250) -> pd.DataFrame:
-    """获取日K线（前复权）—— 单票接口，重试3次"""
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=400)).strftime("%Y%m%d")
-    last_err = None
-    for attempt in range(3):
-        try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start,
-                                    end_date=end, adjust="qfq")
-            if df is None or df.empty:
-                raise ValueError(f"无法获取 {code} 的日K线数据")
-            df = df.sort_values("日期").tail(days).reset_index(drop=True)
-            df.columns = [c.strip() for c in df.columns]
-            return df
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(2)
-    raise ValueError(f"获取 {code} 日K线失败（已重试3次）: {last_err}")
+def _cn_code_to_yahoo(code: str) -> str:
+    """6位A股代码 → Yahoo Finance ticker"""
+    code = code.strip().upper()
+    if code.startswith('6'):
+        return f"{code}.SS"   # 上海
+    elif code.startswith(('0', '3')):
+        return f"{code}.SZ"   # 深圳
+    elif code.startswith(('4', '8')):
+        return f"{code}.BJ"   # 北京
+    else:
+        return f"{code}.SZ"   # 默认深圳
 
 
-def _get_daily(code: str, days: int = 250) -> pd.DataFrame:
+def _yf_download(ticker: str, period: str = "1y") -> pd.DataFrame:
+    """统一的 yfinance 下载接口，带错误处理"""
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, auto_adjust=True)
+        if df is None or df.empty:
+            raise ValueError(f"Yahoo Finance 返回空数据: {ticker}")
+        # 标准化列名
+        df = df.reset_index()
+        # yfinance 可能返回 Date 或 Datetime 列
+        date_col = None
+        for c in df.columns:
+            if 'date' in str(c).lower() or 'datetime' in str(c).lower():
+                date_col = c
+                break
+        if date_col:
+            df.rename(columns={date_col: "日期"}, inplace=True)
+        # 标准化价格列名
+        col_map = {"Open": "开盘", "High": "最高", "Low": "最低",
+                    "Close": "收盘", "Volume": "成交量"}
+        df = df.rename(columns=col_map)
+        # 去掉收盘价为 NaN 的行（当日无数据）
+        if "收盘" in df.columns:
+            df = df.dropna(subset=["收盘"])
+        return df
+    except Exception as e:
+        raise ValueError(f"获取 {ticker} 数据失败: {e}")
+
+
+# ── 数据获取（统一用 yfinance）─────────────────────────────
+
+def _fetch_daily(code: str, market: str, days: int = 250) -> pd.DataFrame:
+    """获取日K线 — A股和美股统一走 Yahoo Finance"""
+    if market == 'cn':
+        ticker = _cn_code_to_yahoo(code)
+    else:
+        ticker = code
+
+    # 多抓一些数据确保够 days 天
+    period_map = {60: "3mo", 120: "6mo", 250: "1y", 500: "2y"}
+    period = period_map.get(max(days * 2, 250), "2y")
+
+    df = _yf_download(ticker, period)
+
+    if len(df) < 5:
+        raise ValueError(f"数据量不足（仅{len(df)}天）: {code}")
+
+    # 补充计算列
+    df["涨跌幅"] = df["收盘"].pct_change() * 100
+    df["涨跌额"] = df["收盘"].diff()
+    if "成交额" not in df.columns:
+        df["成交额"] = df["成交量"] * df["收盘"]  # 估算
+    if "换手率" not in df.columns:
+        df["换手率"] = 0.0  # Yahoo 不提供换手率
+
+    df = df.tail(days).reset_index(drop=True)
+    return df
+
+
+def _get_daily_unified(code: str, market: str, days: int = 250) -> pd.DataFrame:
     key = _cache_key("daily", code)
     cached = _cache_get(key)
-    if cached is not None:
-        if len(cached) >= days:
-            return cached.tail(days)
-    df = _fetch_daily(code, days)
+    if cached is not None and len(cached) >= days:
+        return cached.tail(days).reset_index(drop=True)
+    df = _fetch_daily(code, market, days)
     _cache_set(key, df)
-    return df.tail(days)
+    return df.tail(days).reset_index(drop=True)
 
 
-def _get_realtime(code: str, daily_df: pd.DataFrame) -> dict:
-    """从日K线提取实时行情（无需全市场接口，秒出）"""
+def _get_realtime_unified(code: str, market: str, daily_df: pd.DataFrame) -> dict:
+    """从日K线提取实时行情"""
     row = daily_df.iloc[-1]
-    return {
+    price = float(row["收盘"])
+    prev_price = float(daily_df["收盘"].iloc[-2]) if len(daily_df) >= 2 else price
+    change_pct = round((price / prev_price - 1) * 100, 2) if prev_price > 0 else 0
+
+    result = {
         "代码": code,
         "名称": code,
-        "最新价": float(row["收盘"]),
-        "涨跌幅": float(row.get("涨跌幅", 0)),
+        "最新价": price,
+        "涨跌幅": change_pct,
         "换手率": float(row.get("换手率", 0)),
-        "总市值": 0,  # 由财务数据补充
-        "市盈率-动态": 0,
+        "总市值": 0,       # 由财务数据补充
+        "市盈率-动态": 0,   # 由财务数据补充
         "成交量": float(row.get("成交量", 0)),
         "成交额": float(row.get("成交额", 0)),
+        "内盘": 0,
+        "外盘": 0,
     }
 
+    # 尝试从 yfinance Ticker 获取更多实时信息
+    try:
+        if market == 'cn':
+            ticker = _cn_code_to_yahoo(code)
+        else:
+            ticker = code
+        t = yf.Ticker(ticker)
+        info = t.info
+        if info:
+            # 名称
+            if info.get("shortName"):
+                result["名称"] = info["shortName"]
+            elif info.get("longName"):
+                result["名称"] = info["longName"]
+            # 市值 (Yahoo 返回的是原始单位，需转换)
+            mcap_raw = info.get("marketCap")
+            if mcap_raw:
+                if market == 'us':
+                    result["总市值"] = round(mcap_raw / 1e8, 2)  # USD → 亿
+                else:
+                    result["总市值"] = round(mcap_raw / 1e8, 2)  # CNY → 亿
+            # PE
+            pe_raw = info.get("trailingPE") or info.get("forwardPE")
+            if pe_raw:
+                result["市盈率-动态"] = round(pe_raw, 2)
+            # PB
+            pb_raw = info.get("priceToBook")
+            if pb_raw:
+                result["市净率"] = round(pb_raw, 2)
+            # 52周高低
+            result["52周最高"] = info.get("fiftyTwoWeekHigh")
+            result["52周最低"] = info.get("fiftyTwoWeekLow")
+    except Exception:
+        pass
 
-def _get_financials(code: str) -> dict:
-    """获取基本面数据（使用 stock_financial_abstract）"""
+    return result
+
+
+def _get_financials_unified(code: str, market: str) -> dict:
+    """获取基本面数据 — 统一走 yfinance"""
     key = _cache_key("fin", code)
     cached = _cache_get(key)
     if cached is not None:
@@ -145,203 +215,105 @@ def _get_financials(code: str) -> dict:
         if records:
             return records[0]
         return {}
-    for attempt in range(3):
-        try:
-            fin = ak.stock_financial_abstract(symbol=code)
-            if fin is None or fin.empty:
-                raise ValueError("empty financial data")
-            # 提取关键指标：指标名 → 最新季度值
-            result = {}
-            for i in range(len(fin)):
-                metric = str(fin.iloc[i, 1]).strip()
-                val = fin.iloc[i, 2]  # 最新季度（第3列是最近期）
-                if pd.notna(val):
-                    try:
-                        result[metric] = float(val)
-                    except (ValueError, TypeError):
-                        result[metric] = val
-            _cache_set(key, pd.DataFrame([result]))
-            return result
-        except Exception:
-            if attempt < 2:
-                time.sleep(2)
-    empty = {}
-    _cache_set(key, pd.DataFrame([empty]))
-    return empty
 
-
-# ── 数据获取（美股）──────────────────────────────────────────
-
-_US_COLUMN_MAP = {
-    "date": "日期", "open": "开盘", "high": "最高", "low": "最低",
-    "close": "收盘", "volume": "成交量",
-}
-
-
-def _normalize_us_df(raw: pd.DataFrame) -> pd.DataFrame:
-    """美股 DataFrame → 统一列名（与A股因子兼容）"""
-    df = raw.copy()
-    df = df.rename(columns={k: v for k, v in _US_COLUMN_MAP.items() if k in df.columns})
-    # 补充A股因子需要的列
-    if "成交额" not in df.columns:
-        df["成交额"] = 0
-    if "换手率" not in df.columns:
-        df["换手率"] = 0
-    if "涨跌幅" not in df.columns and "收盘" in df.columns:
-        df["涨跌幅"] = df["收盘"].pct_change() * 100
-    if "涨跌额" not in df.columns:
-        df["涨跌额"] = 0
-    if "振幅" not in df.columns and "最高" in df.columns and "最低" in df.columns:
-        df["振幅"] = (df["最高"] - df["最低"]) / df["收盘"].shift(1) * 100
-    return df
-
-
-def _fetch_daily_us(ticker: str, days: int = 250) -> pd.DataFrame:
-    """获取美股日K线（前复权）"""
-    df = ak.stock_us_daily(symbol=ticker, adjust="qfq")
-    if df is None or df.empty:
-        raise ValueError(f"无法获取美股 {ticker} 的日K线数据")
-    df = df.sort_values("date").tail(days).reset_index(drop=True)
-    return _normalize_us_df(df)
-
-
-def _get_daily_us(ticker: str, days: int = 250) -> pd.DataFrame:
-    key = _cache_key("daily_us", ticker)
-    cached = _cache_get(key)
-    if cached is not None:
-        if len(cached) >= days:
-            return cached.tail(days)
-    df = _fetch_daily_us(ticker, days)
-    _cache_set(key, df)
-    return df.tail(days)
-
-
-def _get_realtime_us(ticker: str, daily_df: pd.DataFrame) -> dict:
-    """从美股日K线提取实时行情"""
-    row = daily_df.iloc[-1]
-    price = float(row["收盘"])
-    prev = float(daily_df["收盘"].iloc[-2]) if len(daily_df) >= 2 else price
-    return {
-        "代码": ticker,
-        "名称": ticker,  # 后面由财务数据补充
-        "最新价": price,
-        "涨跌幅": round((price / prev - 1) * 100, 2),
-        "换手率": 0,  # 美股日K线无换手率
-        "总市值": 0,
-        "市盈率-动态": 0,
-        "成交量": float(row.get("成交量", 0)),
-        "成交额": float(row.get("成交额", 0)),
-        "内盘": 0,
-        "外盘": 0,
-    }
-
-
-def _get_financials_us(ticker: str) -> dict:
-    """获取美股基本面数据"""
-    key = _cache_key("fin_us", ticker)
-    cached = _cache_get(key)
-    if cached is not None:
-        records = cached.to_dict("records")
-        if records:
-            return records[0]
-        return {}
     try:
-        fin = ak.stock_financial_us_analysis_indicator_em(symbol=ticker)
-        if fin is None or fin.empty:
-            raise ValueError("empty")
-        latest = fin.iloc[-1].to_dict()
+        if market == 'cn':
+            ticker = _cn_code_to_yahoo(code)
+        else:
+            ticker = code
+
+        t = yf.Ticker(ticker)
+        info = t.info or {}
         result = {}
-        # 映射到中文名（与A股因子兼容）
+
+        # 提取关键财务指标
         field_map = {
-            "SECURITY_NAME_ABBR": "名称",
-            "BASIC_EPS": "基本每股收益",
-            "DILUTED_EPS": "摊薄每股收益_最新股本",
-            "PARENT_HOLDER_NETPROFIT": "归母净利润",
-            "OPERATE_INCOME": "营业总收入",
-            "ROE_AVG": "净资产收益率",
-            "GROSS_PROFIT_RATIO": "毛利率",
-            "NET_PROFIT_RATIO": "净利润率",
+            "trailingEps": "基本每股收益",
+            "forwardEps": "预测每股收益",
+            "returnOnEquity": "净资产收益率",
+            "returnOnAssets": "资产收益率",
+            "grossMargins": "毛利率",
+            "operatingMargins": "营业利润率",
+            "profitMargins": "净利润率",
+            "revenueGrowth": "营收增长率",
+            "earningsGrowth": "盈利增长率",
+            "totalRevenue": "营业总收入",
+            "netIncomeToCommon": "归母净利润",
+            "totalDebt": "总负债",
+            "totalCash": "总现金",
+            "bookValue": "每股净资产",
+            "priceToBook": "市净率",
+            "trailingPE": "市盈率(TTM)",
+            "forwardPE": "市盈率(前瞻)",
+            "pegRatio": "PEG",
+            "dividendYield": "股息率",
+            "payoutRatio": "分红比率",
+            "beta": "Beta",
+            "enterpriseValue": "企业价值",
+            "ebitda": "EBITDA",
+            "operatingCashflow": "经营现金流",
+            "freeCashflow": "自由现金流",
+            "sharesOutstanding": "总股本",
         }
+
         for en, cn in field_map.items():
-            val = latest.get(en)
-            if pd.notna(val):
+            val = info.get(en)
+            if val is not None and pd.notna(val):
                 try:
                     result[cn] = float(val)
                 except (ValueError, TypeError):
                     result[cn] = val
-        # 保留原名
-        name = latest.get("SECURITY_NAME_ABBR")
-        if name and pd.notna(name):
+
+        # 显示名称
+        name = info.get("shortName") or info.get("longName")
+        if name:
             result["_display_name"] = str(name)
+
         _cache_set(key, pd.DataFrame([result]))
         return result
-    except Exception:
+    except Exception as e:
         pass
+
     empty = {}
     _cache_set(key, pd.DataFrame([empty]))
     return empty
 
 
-# ── 统一数据获取入口 ─────────────────────────────────────────
-
-def _get_daily_unified(code: str, market: str, days: int = 250) -> pd.DataFrame:
-    if market == 'us':
-        return _get_daily_us(code, days)
-    return _get_daily(code, days)
-
-
-def _get_realtime_unified(code: str, market: str, df: pd.DataFrame) -> dict:
-    if market == 'us':
-        return _get_realtime_us(code, df)
-    return _get_realtime(code, df)
-
-
-def _get_financials_unified(code: str, market: str) -> dict:
-    if market == 'us':
-        return _get_financials_us(code)
-    return _get_financials(code)
-
-
-# ── 指数数据 ───────────────────────────────────────────────
+# ── 指数数据（Yahoo Finance）────────────────────────────────
 
 def _get_index_daily() -> pd.DataFrame:
-    """获取上证指数日K线"""
+    """获取上证指数日K线 (000001.SS)"""
     key = _cache_key("idx", "sh000001")
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=400)).strftime("%Y%m%d")
-    df = ak.stock_zh_index_daily_em(symbol="sh000001", start_date=start, end_date=end)
-    df = df.sort_values("date").tail(120).reset_index(drop=True)
-    _cache_set(key, df)
-    return df
-
-
-def _get_sp500_index() -> pd.DataFrame:
-    """获取标普500日K线（SPY作为代理）"""
-    key = _cache_key("idx", "sp500")
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
     try:
-        raw = ak.stock_us_daily(symbol="SPY", adjust="qfq")
-        df = raw.sort_values("date").tail(120).reset_index(drop=True)
+        df = _yf_download("000001.SS", "6mo")
+        df = df.tail(120).reset_index(drop=True)
         _cache_set(key, df)
         return df
     except Exception:
         return pd.DataFrame()
 
 
-@lru_cache(maxsize=1)
-def _get_stock_list_df() -> pd.DataFrame:
+def _get_sp500_index() -> pd.DataFrame:
+    """获取标普500日K线 (^GSPC)"""
+    key = _cache_key("idx", "sp500")
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
     try:
-        return ak.stock_info_a_code_name()
+        df = _yf_download("^GSPC", "6mo")
+        df = df.tail(120).reset_index(drop=True)
+        _cache_set(key, df)
+        return df
     except Exception:
         return pd.DataFrame()
 
 
 # ── 搜索 ────────────────────────────────────────────────────
+
+# ── 搜索（纯本地映射 + yfinance 验证）──────────────────────
 
 # 常用美股映射
 _US_POPULAR: dict[str, str] = {
@@ -363,7 +335,24 @@ _US_POPULAR: dict[str, str] = {
     "SPY": "标普500ETF", "QQQ": "纳斯达克100ETF",
 }
 
-# 英文别名 → ticker（用于搜索）
+# 常用 A 股映射（热门股）
+_CN_POPULAR: dict[str, str] = {
+    "600519": "贵州茅台", "601318": "中国平安", "600036": "招商银行",
+    "601398": "工商银行", "601988": "中国银行", "601288": "农业银行",
+    "600276": "恒瑞医药", "002594": "比亚迪", "300750": "宁德时代",
+    "600900": "长江电力", "601012": "隆基绿能", "002475": "立讯精密",
+    "600584": "长电科技", "002962": "五方光电", "300390": "天华新能",
+    "000858": "五粮液", "000333": "美的集团", "601888": "中国中车",
+    "002230": "科大讯飞", "688981": "中芯国际", "002371": "北方华创",
+    "300059": "东方财富", "601166": "兴业银行", "600809": "山西汾酒",
+    "000651": "格力电器", "002714": "牧原股份", "603259": "药明康德",
+    "300122": "智飞生物", "002304": "洋河股份", "600887": "伊利股份",
+    "000568": "泸州老窖", "603288": "海天味业", "002352": "顺丰控股",
+    "601899": "紫金矿业", "601985": "中国核电", "00381": "中国石油",
+    "600028": "中国石化", "601088": "中国神华", "601668": "中国建筑",
+}
+
+# 英文别名 → ticker
 _US_ALIAS: dict[str, str] = {
     "APPLE": "AAPL", "MICROSOFT": "MSFT", "GOOGLE": "GOOGL", "AMAZON": "AMZN",
     "NVIDIA": "NVDA", "TESLA": "TSLA", "META": "META", "FACEBOOK": "META",
@@ -385,20 +374,19 @@ _US_ALIAS: dict[str, str] = {
 }
 
 
-@lru_cache(maxsize=1)
-def _get_stock_list_df() -> pd.DataFrame:
-    try:
-        return ak.stock_info_a_code_name()
-    except Exception:
-        return pd.DataFrame()
-
-
 def search_stock(name: str, limit: int = 10) -> list[dict]:
-    """搜索股票 — 支持A股名称和美股ticker"""
-    name_upper = name.strip().upper()
+    """搜索股票 — 纯本地匹配，无外部API调用"""
+    name_stripped = name.strip()
+    name_upper = name_stripped.upper()
     results = []
 
-    # 美股 ticker 精确/前缀匹配
+    # 1. 6位数字 → A股精确匹配
+    if re.match(r'^\d{6}$', name_upper):
+        cn_name = _CN_POPULAR.get(name_upper, f"A股{name_upper}")
+        results.append({"代码": name_upper, "名称": cn_name, "市场": "A股"})
+        return results[:limit]
+
+    # 2. 美股 ticker 精确/前缀匹配
     if re.match(r'^[A-Z]{1,5}$', name_upper):
         if name_upper in _US_POPULAR:
             results.append({"代码": name_upper, "名称": _US_POPULAR[name_upper], "市场": "美股"})
@@ -407,29 +395,26 @@ def search_stock(name: str, limit: int = 10) -> list[dict]:
                 results.append({"代码": ticker, "名称": cname, "市场": "美股"})
             if len(results) >= limit:
                 return results[:limit]
-
-        # 英文别名匹配
+        # 英文别名
         ticker_from_alias = _US_ALIAS.get(name_upper)
         if ticker_from_alias and ticker_from_alias in _US_POPULAR:
             entry = {"代码": ticker_from_alias, "名称": _US_POPULAR[ticker_from_alias], "市场": "美股"}
             if entry not in results:
                 results.append(entry)
-
         return results[:limit]
 
-    # 非纯代码 → 模糊搜索（美股+ A股）
-    # 美股中文名/英文名匹配
+    # 3. 中文名模糊搜索 — 美股
     for ticker, cname in _US_POPULAR.items():
-        if name.upper() in cname.upper() or name.upper() in ticker:
+        if name_stripped in cname or name_upper in ticker.upper():
             entry = {"代码": ticker, "名称": cname, "市场": "美股"}
             if entry not in results:
                 results.append(entry)
         if len(results) >= limit:
             return results[:limit]
 
-    # 英文别名匹配
+    # 4. 英文别名匹配
     for alias, ticker in _US_ALIAS.items():
-        if name_upper in alias or alias in name_upper:
+        if name_upper in alias or alias.startswith(name_upper):
             ticker_cn = _US_POPULAR.get(ticker, ticker)
             entry = {"代码": ticker, "名称": ticker_cn, "市场": "美股"}
             if entry not in results:
@@ -437,19 +422,22 @@ def search_stock(name: str, limit: int = 10) -> list[dict]:
         if len(results) >= limit:
             return results[:limit]
 
-    # A股搜索（仅中文查询时启用）
+    # 5. 中文名搜索 — A股
     looks_chinese = bool(re.search(r'[\u4e00-\u9fff]', name))
     if len(results) < limit and looks_chinese:
-        try:
-            df = _get_stock_list_df()
-            if not df.empty:
-                mask = df["名称"].str.contains(name, na=False)
-                for _, row in df[mask].head(limit - len(results)).iterrows():
-                    results.append({"代码": row["代码"], "名称": row["名称"], "市场": "A股"})
-        except Exception:
-            pass
+        for code, cname in _CN_POPULAR.items():
+            if name_stripped in cname:
+                results.append({"代码": code, "名称": cname, "市场": "A股"})
+            if len(results) >= limit:
+                return results[:limit]
 
     return results[:limit]
+
+
+@lru_cache(maxsize=1)
+def _get_stock_list_df() -> pd.DataFrame:
+    """兼容旧接口，返回空DataFrame（已切换到本地映射）"""
+    return pd.DataFrame()
 
 
 # ── 技术指标计算 ────────────────────────────────────────────
@@ -841,10 +829,15 @@ def factor_market(df: pd.DataFrame, market: str = "cn") -> dict:
             if idx.empty:
                 return {"score": 3.0, "detail": {"标普5日涨跌": 0, "标普20日涨跌": 0}}
             idx_label = "标普"
-            idx_close = idx["close"] if "close" in idx.columns else idx["收盘"]
         else:
             idx = _get_index_daily()
+        # 统一取收盘价列
+        if "收盘" in idx.columns:
+            idx_close = idx["收盘"]
+        elif "close" in idx.columns:
             idx_close = idx["close"]
+        else:
+            raise ValueError("无收盘价列")
         idx_ret_5 = float((idx_close.iloc[-1] / idx_close.iloc[-6] - 1) * 100) if len(idx_close) >= 6 else 0
         idx_ret_20 = float((idx_close.iloc[-1] / idx_close.iloc[-21] - 1) * 100) if len(idx_close) >= 21 else 0
     except Exception:
